@@ -118,8 +118,14 @@ object NettyConnectionPool {
           case _          => bootstrap
         }).connect()
       }
-      _             <- NettyFutureExecutor.executed(channelFuture)
-      result        <- ZIO.attempt(channelFuture.channel())
+      result        <- {
+        NettyFutureExecutor.executed(channelFuture) *> ZIO.attempt(channelFuture.channel())
+        // Interruption never happens.
+      }.onInterrupt {
+        ZIO.debug("INTERRUPTED")
+        // Unsure if cancel if necessary.
+        // *> ZIO.attempt(channelFuture.cancel(true)).ignore
+      }
     } yield result
 
     for {
@@ -129,6 +135,8 @@ object NettyConnectionPool {
       chunk          = NonEmptyChunk.fromChunk(createChannels).get
       result <- happyEyeballsWithRelease(
         chunk,
+        // During unit testing in NettyConnectionPoolSpec, the test will wait unit this duration elapses.
+        // Race should make this terminate after first success, but it's hanging.
         250.millis,
         (jchannel: JChannel) => {
           ZIO
@@ -196,15 +204,40 @@ object NettyConnectionPool {
    * Returns the first successful connection. Fails with an exception if none
    * succeed.
    */
-  def executeHappyEyeballs[A](tasks: NonEmptyChunk[Task[A]], delay: Duration): Task[A] = {
+  def executeHappyEyeballsPromise[A](tasks: NonEmptyChunk[Task[A]], delay: Duration): Task[A] = {
+    val task = tasks.head
+    if (tasks.size == 1) {
+      task
+    } else {
+      NonEmptyChunk.fromChunk(tasks.tail) match {
+        case None       => task
+        case Some(tail) =>
+          Promise.make[Nothing, Unit].flatMap { failurePromise =>
+            val taskWithFailure = task.onError(_ => failurePromise.complete(ZIO.unit).ignore)
+            val continue        = for {
+              delayFiber <- failurePromise.interrupt.delay(delay).fork
+              // Wait until the previous task fails or the delay expires.
+              _          <- delayFiber.join race failurePromise.await
+              r          <- executeHappyEyeballsPromise(tail, delay)
+            } yield r
+            taskWithFailure race continue
+          }
+      }
+    }
+  }
+
+  // Alternate and equivalent implementation using ZIO.memoize
+  def executeHappyEyeballsMemo[A](tasks: NonEmptyChunk[Task[A]], delay: Duration, index: Int = 0): Task[A] = {
     if (tasks.size == 1) {
       tasks.head
     } else {
       NonEmptyChunk.fromChunk(tasks.tail) match {
         case None       => tasks.head
         case Some(tail) =>
-          val continue = executeHappyEyeballs(tail, delay).memoize.flatten
-          tasks.head.catchAll(_ => continue) race continue.delay(delay)
+          for {
+            continue <- executeHappyEyeballsMemo(tail, delay, index + 1).memoize
+            result   <- tasks.head.catchAll(_ => continue) race continue.delay(delay)
+          } yield result
       }
     }
   }
@@ -217,7 +250,7 @@ object NettyConnectionPool {
     tasks: NonEmptyChunk[Task[A]],
     delay: Duration,
     releaseExtra: A => UIO[Unit],
-  ) = for {
+  ): Task[A] = for {
     successful <- Queue.bounded[A](tasks.size)
     enqueueingTasks = tasks.map {
       _.onExit {
@@ -225,7 +258,7 @@ object NettyConnectionPool {
         case Exit.Failure(_)     => ZIO.unit
       }
     }
-    _ <- executeHappyEyeballs(enqueueingTasks, delay)
+    _ <- executeHappyEyeballsMemo(enqueueingTasks, delay)
     successes <- successful.takeAll
     _         <- ZIO.foreachParDiscard(successes.tail)(releaseExtra)
   } yield successes.head
